@@ -10,8 +10,10 @@ use App\Models\Categoria;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Log;
 use Illuminate\View\View;
 use Intervention\Image\ImageManagerStatic as Image;
+use Cloudinary\Cloudinary;
 
 class ProductoController extends Controller
 {
@@ -67,7 +69,19 @@ class ProductoController extends Controller
 
         $imagenMensaje = '';
         if ($request->hasFile('imagen')) {
-            $data['imagen'] = $this->redimensionarYGuardarImagen($request->file('imagen'), 'productos');
+            $rutaImagen = $this->redimensionarYGuardarImagen($request->file('imagen'), 'productos');
+            
+            if (!$rutaImagen) {
+                Log::error('ProductoController::store - No se pudo guardar imagen', [
+                    'user_id' => auth()->id(),
+                    'branch_id' => $branchId
+                ]);
+                return redirect()->route('supervisor.productos.create')
+                    ->withInput()
+                    ->with('error', 'Error al procesar la imagen. Por favor intenta de nuevo.');
+            }
+            
+            $data['imagen'] = $rutaImagen;
             $imagenMensaje = ' La imagen se ha redimensionado a 800x600px automáticamente.';
         }
 
@@ -106,10 +120,31 @@ class ProductoController extends Controller
         $imagenMensaje = '';
         if ($request->hasFile('imagen')) {
             // Eliminar imagen anterior si existe
-            if ($producto->imagen) {
-                Storage::disk('public')->delete($producto->imagen);
+            if ($producto->imagen && Storage::disk('public')->exists($producto->imagen)) {
+                try {
+                    Storage::disk('public')->delete($producto->imagen);
+                    Log::info('ProductoController: Imagen anterior eliminada', ['path' => $producto->imagen]);
+                } catch (\Exception $e) {
+                    Log::warning('ProductoController: Error eliminando imagen anterior', [
+                        'path' => $producto->imagen,
+                        'error' => $e->getMessage()
+                    ]);
+                }
             }
-            $data['imagen'] = $this->redimensionarYGuardarImagen($request->file('imagen'), 'productos');
+
+            $rutaImagen = $this->redimensionarYGuardarImagen($request->file('imagen'), 'productos');
+            
+            if (!$rutaImagen) {
+                Log::error('ProductoController::update - No se pudo guardar imagen', [
+                    'user_id' => auth()->id(),
+                    'producto_id' => $producto->id
+                ]);
+                return redirect()->route('supervisor.productos.edit', $producto)
+                    ->withInput()
+                    ->with('error', 'Error al procesar la imagen. Por favor intenta de nuevo.');
+            }
+            
+            $data['imagen'] = $rutaImagen;
             $imagenMensaje = ' La imagen se ha redimensionado a 800x600px automáticamente.';
         }
 
@@ -128,9 +163,25 @@ class ProductoController extends Controller
                 ->with('error', 'No se puede eliminar un producto con stock mayor a 0.');
         }
 
-        // Eliminar imagen si existe
+        // Eliminar imagen si existe en Cloudinary
         if ($producto->imagen) {
-            Storage::disk('public')->delete($producto->imagen);
+            try {
+                $cloudinary = new Cloudinary([
+                    'cloud' => [
+                        'cloud_name' => env('CLOUDINARY_NAME'),
+                        'api_key' => env('CLOUDINARY_API_KEY'),
+                        'api_secret' => env('CLOUDINARY_API_SECRET'),
+                    ]
+                ]);
+                
+                $cloudinary->uploadApi()->destroy($producto->imagen);
+                Log::info('Imagen eliminada de Cloudinary', ['public_id' => $producto->imagen]);
+            } catch (\Exception $e) {
+                Log::warning('Error eliminando imagen de Cloudinary', [
+                    'public_id' => $producto->imagen,
+                    'error' => $e->getMessage()
+                ]);
+            }
         }
 
         $producto->delete();
@@ -147,29 +198,81 @@ class ProductoController extends Controller
     }
 
     /**
-     * Redimensiona una imagen a 800x600px y la guarda en storage
+     * Redimensiona una imagen a 800x600px y la guarda en Cloudinary
      *
      * @param \Illuminate\Http\UploadedFile $imagen
      * @param string $directorio
-     * @return string Ruta del archivo guardado
+     * @return string|null Public ID de Cloudinary
      */
-    private function redimensionarYGuardarImagen($imagen, string $directorio): string
+    private function redimensionarYGuardarImagen($imagen, string $directorio): ?string
     {
-        // Crear instancia de Intervention Image
-        $img = Image::make($imagen)
-            ->resize(800, 600, function ($constraint) {
-                $constraint->aspectRatio(); // Mantener proporción
-                $constraint->upsize(); // No ampliar si es más pequeña
-            })
-            ->encode('jpg', 85); // Codificar como JPG con 85% de calidad
+        try {
+            // Validar que sea una imagen
+            if (!$imagen || !$imagen->isValid()) {
+                Log::error('ProductoController: Imagen no válida', [
+                    'error' => $imagen->getError() ?? 'Archivo inválido'
+                ]);
+                throw new \Exception('La imagen no es válida');
+            }
 
-        // Generar nombre único
-        $filename = time() . '_' . uniqid() . '.jpg';
-        $path = $directorio . '/' . $filename;
+            // Redimensionar con Intervention Image
+            $img = Image::make($imagen)
+                ->resize(800, 600, function ($constraint) {
+                    $constraint->aspectRatio();
+                    $constraint->upsize();
+                })
+                ->encode('jpg', 85);
 
-        // Guardar en storage público
-        Storage::disk('public')->put($path, (string) $img);
+            // Generar nombre único
+            $filename = time() . '_' . uniqid();
 
-        return $path;
+            // Guardar temporalmente en disco local
+            $tempPath = storage_path("app/temp/{$filename}.jpg");
+            $tempDir = storage_path("app/temp");
+            
+            if (!is_dir($tempDir)) {
+                mkdir($tempDir, 0755, true);
+            }
+            
+            file_put_contents($tempPath, (string) $img);
+
+            // Subir a Cloudinary
+            $cloudinary = new Cloudinary([
+                'cloud' => [
+                    'cloud_name' => env('CLOUDINARY_NAME'),
+                    'api_key' => env('CLOUDINARY_API_KEY'),
+                    'api_secret' => env('CLOUDINARY_API_SECRET'),
+                ]
+            ]);
+
+            $result = $cloudinary->uploadApi()->upload($tempPath, [
+                'folder' => $directorio,
+                'resource_type' => 'auto',
+                'public_id' => $filename,
+            ]);
+
+            // Eliminar archivo temporal
+            if (file_exists($tempPath)) {
+                unlink($tempPath);
+            }
+
+            $publicId = $result['public_id'];
+            
+            Log::info('ProductoController: Imagen subida a Cloudinary', [
+                'public_id' => $publicId,
+                'url' => $result['secure_url']
+            ]);
+
+            return $publicId;
+
+        } catch (\Exception $e) {
+            Log::error('ProductoController: Error en redimensionarYGuardarImagen', [
+                'mensaje' => $e->getMessage(),
+                'linea' => $e->getLine(),
+                'archivo' => $e->getFile()
+            ]);
+            
+            return null;
+        }
     }
 }

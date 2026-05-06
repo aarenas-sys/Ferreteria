@@ -7,160 +7,384 @@ use App\Models\Branch;
 use App\Models\Discount;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Session;
+use Illuminate\Support\Facades\Log;
 
 /**
- * ChatService - Chatbot sin IA basado en reglas y consultas a BD
- * 
- * El chatbot funciona 100% con lógica de reglas:
- * - Detecta intención por palabras clave
- * - Extrae nombre de sucursal
- * - Consulta BD directamente
- * - NO usa IA ni APIs externas
+ * ChatService — Chatbot híbrido: reglas + IA (Groq como fallback)
+ *
+ * Flujo de decisión:
+ *  1. Se normaliza el mensaje
+ *  2. Se detecta la intención por palabras clave (lógica original intacta)
+ *  3. Si la intención es conocida → responde con reglas (BD)
+ *  4. Si la intención es 'desconocida' → delega a Groq para respuesta contextual
  */
 class ChatService
 {
-    /**
-     * Palabras clave para detectar intenciones
-     */
-    private array $palabrasClaveStock = ['stock', 'disponible', 'hay', 'tenemos', 'quedan', 'cantidad', 'tiene'];
-    private array $palabrasClavePrice = ['precio', 'cuesta', 'vale', 'costo', 'cuanto'];
-    private array $palabrasClavePromo = ['promocion', 'descuento', 'rebaja', 'oferta'];
-    private array $palabrasClaveHorario = ['horario', 'hora', 'abierto', 'cierra'];
-    private array $palabrasClaveUbicacion = ['ubicacion', 'direccion', 'donde', 'localizacion'];
-    private array $palabrasClaveContacto = ['contacto', 'telefono', 'whatsapp', 'llamar', 'llamada', 'email', 'correo'];
+    // ─── Dependencia IA ────────────────────────────────────────────────────────
+
+    public function __construct(private readonly GroqService $groq) {}
+
+    // ─── Palabras clave (sin cambios respecto al original) ─────────────────────
+
+    private array $palabrasClaveStock        = ['stock', 'disponible', 'hay', 'tenemos', 'quedan', 'cantidad', 'tiene'];
+    private array $palabrasClavePrice        = ['precio', 'cuesta', 'vale', 'costo', 'cuanto'];
+    private array $palabrasClavePromo        = ['promocion', 'descuento', 'rebaja', 'oferta'];
+    private array $palabrasClaveHorario      = ['horario', 'hora', 'abierto', 'cierra'];
+    private array $palabrasClaveUbicacion    = ['ubicacion', 'direccion', 'donde', 'localizacion'];
+    private array $palabrasClaveContacto     = ['contacto', 'telefono', 'whatsapp', 'llamar', 'llamada', 'email', 'correo'];
     private array $palabrasClaveInfoSucursal = ['sucursal', 'sucursales', 'branch', 'branches'];
 
-    /**
-     * Palabras a eliminar al extraer nombre del producto
-     */
     private array $palabrasAEliminar = [
         'precio', 'hay', 'en', 'la', 'el', 'de', 'sucursal', 'del', 'las', 'los',
         'un', 'una', 'unos', 'unas', 'es', 'son', 'que', 'cuanto', 'cuantos',
         'cuanta', 'cuantas', 'cuesta', 'vale', 'disponible', 'stock', 'tenemos'
     ];
 
-    /**
-     * Nombres de sucursales disponibles
-     */
     private array $sucursalesConocidas = ['norte', 'sur', 'centro', 'este', 'oeste'];
 
+    // ─── System prompt para Groq ────────────────────────────────────────────────
+
     /**
-     * Procesa el mensaje y devuelve la respuesta (SOLO REGLAS, SIN IA)
+     * Instrucción de sistema que define el rol de Groq dentro de FerreNet.
+     * Se inyecta contexto de BD para que la IA tenga información real.
      */
-    public function procesarMensaje(string $mensaje): string
+    private function buildSystemPrompt(): string
     {
-        // Normalizar entrada
-        $mensajeNorm = $this->normalizarTexto($mensaje);
+        // Recopilar info básica de sucursales para darle contexto a la IA
+        $sucursales = Branch::select('name', 'address', 'phone')->get();
+        $sucursalInfo = $sucursales->map(fn($b) => "{$b->name} — {$b->address} — Tel: {$b->phone}")->implode("\n");
 
-        // Detectar intención basada en palabras clave
-        $intencion = $this->detectarIntencion($mensajeNorm);
+        return <<<PROMPT
+Eres el asistente virtual de FerreNet, una ferretería con múltiples sucursales.
+Responde siempre en español, de forma amable, clara y concisa.
+Usa emojis ocasionalmente para hacer la conversación más amigable.
+NO inventes precios ni stock — si no tienes datos exactos, orienta al usuario a preguntar de forma más específica.
 
-        // Detectar sucursal mencionada en el mensaje
-        $sucursal = $this->detectarSucursal($mensajeNorm);
+Sucursales disponibles:
+{$sucursalInfo}
 
-        // Si no hay sucursal especificada y el usuario está autenticado, usar su sucursal
-        if (!$sucursal && Auth::check()) {
-            $user = Auth::user();
-            if (isset($user->sucursal_id) && $user->sucursal_id) {
-                $sucursal = $this->obtenerNombreSucursal($user->sucursal_id);
+Horario general: Lunes a Viernes 8:00 AM - 5:00 PM, Sábados y Domingos cerrado.
+
+Si el usuario pregunta algo que no puedes responder con seguridad (como stock exacto o precio de un producto),
+pídele que reformule su pregunta usando frases como "¿Hay [producto]?" o "¿Precio del [producto]?".
+PROMPT;
+    }
+
+    // ─── Entrada pública para búsqueda por imagen ──────────────────────────────
+
+    /**
+     * Procesa una imagen subida por el usuario:
+     * 1. Groq Vision describe la imagen y extrae términos de búsqueda
+     * 2. Se buscan coincidencias en BD por nombre y categoría
+     * 3. Si hay varias → lista para que el usuario elija
+     * 4. Si hay exactamente una → procesa directamente con la lógica normal
+     * 5. Si no hay → pide que escriba el nombre manualmente
+     *
+     * La lógica de admin/sucursal se aplica al momento de consultar stock/precio.
+     */
+    public function procesarMensajeConImagen(string $imagenBase64, string $mimeType, string $mensajeUsuario = ''): string
+    {
+        // Paso 1: Groq Vision analiza la imagen
+        try {
+            $jsonRespuesta = $this->groq->describeImage($imagenBase64, $mimeType, $mensajeUsuario);
+            
+            // DEBUG Y VALIDACIÓN
+            Log::info('GroqVision - Respuesta RAW: ' . substr($jsonRespuesta, 0, 200));
+            
+            // Validar que la respuesta sea JSON válido
+            if (empty($jsonRespuesta) || !json_decode($jsonRespuesta)) {
+                Log::error('GroqVision - JSON inválido o vacío: ' . $jsonRespuesta);
+                return "⚠️ Error: La respuesta de visión no es válida. Por favor, escribe el nombre del producto directamente.";
+            }
+        } catch (\RuntimeException $e) {
+            Log::warning('GroqVision falló: ' . $e->getMessage());
+            return "⚠️ No pude analizar la imagen. Por favor escribe el nombre del producto directamente.";
+        }
+
+        // Paso 2: Parsear JSON de Groq
+        $datos = json_decode($jsonRespuesta, true);
+
+        // Validar estructura del JSON
+        if (!is_array($datos)) {
+            Log::error('GroqVision - Datos no son array: ' . $jsonRespuesta);
+            return "⚠️ Error procesando la imagen. Por favor escribe el nombre del producto.";
+        }
+
+        if (!$datos || ($datos['descripcion'] ?? '') === 'no_identificado' || empty($datos['terminos'])) {
+            Log::info('GroqVision - Producto no identificado', [
+                'descripcion' => $datos['descripcion'] ?? 'N/A',
+                'terminos' => $datos['terminos'] ?? []
+            ]);
+            return "🤔 No identifiqué un producto de ferretería en la imagen.\n\n¿Puedes escribir el nombre del producto que buscas?";
+        }
+
+        $descripcion = $datos['descripcion'];
+        $terminos    = $datos['terminos'];
+
+        Log::info('GroqVision - Producto identificado', [
+            'descripcion' => $descripcion,
+            'terminos' => $terminos
+        ]);
+
+        // Paso 3: Buscar en BD por nombre y categoría usando los términos
+        $productos = $this->buscarProductosPorTerminos($terminos);
+
+        if ($productos->isEmpty()) {
+            Session::put('imagen_descripcion', $descripcion);
+            Log::info('GroqVision - No encontrados productos similares', [
+                'terminos' => $terminos,
+                'descripcion' => $descripcion
+            ]);
+            return "🔍 La imagen parece ser **{$descripcion}**, pero no encontré productos similares en el catálogo.\n\n¿Puedes escribir el nombre exacto del producto?";
+        }
+
+        // Paso 4: Una sola coincidencia → procesar directamente
+        if ($productos->count() === 1) {
+            $producto = $productos->first();
+            Session::put('imagen_producto_confirmado', $producto->nombre);
+            Log::info('GroqVision - Una coincidencia encontrada', [
+                'producto_id' => $producto->id,
+                'producto_nombre' => $producto->nombre
+            ]);
+            // Construir mensaje como si el usuario lo hubiera escrito
+            return $this->procesarMensaje("¿Hay {$producto->nombre}?");
+        }
+
+        // Paso 5: Varias coincidencias → mostrar lista con botones para elegir
+        Session::put('imagen_descripcion', $descripcion);
+
+        Log::info('GroqVision - Múltiples coincidencias', [
+            'cantidad' => $productos->count(),
+            'productos' => $productos->pluck('nombre')->toArray()
+        ]);
+
+        // Crear opciones únicas por nombre para evitar duplicados en UI
+        $opcionesUnicas = [];
+        $nombresVisto = [];
+        
+        foreach ($productos as $p) {
+            if (!in_array($p->nombre, $nombresVisto)) {
+                $opcionesUnicas[] = [
+                    'label' => $p->nombre,
+                    'value' => '¿Hay ' . $p->nombre . '?',
+                ];
+                $nombresVisto[] = $p->nombre;
             }
         }
 
-        // Procesar según la intención
-        return match ($intencion) {
-            'stock' => $this->consultarStock($mensajeNorm, $sucursal),
-            'precio' => $this->consultarPrecio($mensajeNorm, $sucursal),
-            'promocion' => $this->consultarPromociones($sucursal),
-            'horario' => $this->consultarHorario(),
-            'ubicacion' => $this->consultarUbicacion($sucursal),
-            'contacto' => $this->consultarContacto($sucursal),
-            'info_sucursal' => $this->consultarInfoSucursal($sucursal),
-            default => $this->respuestaNoEntendida()
-        };
+        $opcionesJson = json_encode($opcionesUnicas, JSON_UNESCAPED_UNICODE);
+
+        return "🔍 La imagen parece ser **{$descripcion}**. Encontré estos productos similares:\n\n__OPCIONES__{$opcionesJson}\n\n_¿No es ninguno? Escribe el nombre exacto._";
     }
 
     /**
-     * Detecta la intención del mensaje basada en palabras clave
+     * Busca productos en BD usando una lista de términos.
+     * Busca en nombre del producto Y en nombre de categoría.
+     * Retorna máximo 6 resultados para no abrumar al usuario.
      */
+    private function buscarProductosPorTerminos(array $terminos)
+    {
+        return Producto::query()
+            ->where(function ($query) use ($terminos) {
+                foreach ($terminos as $termino) {
+                    $t = strtolower(trim($termino));
+                    $query->orWhereRaw('LOWER(nombre) LIKE ?', ["%{$t}%"]);
+                }
+            })
+            ->orWhereHas('categoria', function ($query) use ($terminos) {
+                $query->where(function ($q) use ($terminos) {
+                    foreach ($terminos as $termino) {
+                        $t = strtolower(trim($termino));
+                        $q->orWhereRaw('LOWER(nombre) LIKE ?', ["%{$t}%"]);
+                    }
+                });
+            })
+            ->select('id', 'nombre', 'precio', 'stock', 'categoria_id')
+            ->distinct()
+            ->limit(6)
+            ->get();
+    }
+
+    // ─── Punto de entrada principal ─────────────────────────────────────────────
+
+    /**
+     * Procesa el mensaje del usuario.
+     * Mantiene la lógica original de reglas y agrega Groq como fallback.
+     */
+    /**
+     * Intenciones que tienen sentido filtrar por sucursal.
+     * Horario y promociones generales NO están aquí porque pueden responderse globalmente.
+     */
+    private array $intencionesConSucursal = ['stock', 'precio', 'ubicacion', 'contacto', 'info_sucursal'];
+
+    public function procesarMensaje(string $mensaje): string
+    {
+        $mensajeNorm = $this->normalizarTexto($mensaje);
+        $intencion   = $this->detectarIntencion($mensajeNorm);
+        $sucursal    = $this->detectarSucursal($mensajeNorm);
+
+        // ── Manejo especial: Admin selecciona sucursal ────────────────────────
+        // Si el mensaje es "sucursal_X", recuperar el mensaje pendiente
+        if (Auth::check() && Auth::user()->role === 'admin') {
+            if (preg_match('/^sucursal_(.+)$/i', $mensaje, $matches)) {
+                $nombreSucursal = ucfirst(strtolower($matches[1]));
+                $sucursal = strtolower($nombreSucursal);
+                
+                // Recuperar el mensaje pendiente (ej: "¿Hay martillos?")
+                $mensajePendiente = Session::get('admin_mensaje_pendiente');
+                
+                if ($mensajePendiente) {
+                    Session::forget('admin_mensaje_pendiente');
+                    // Reprocessar el mensaje pendiente CON la sucursal elegida
+                    $mensajeConSucursal = "{$mensajePendiente} {$nombreSucursal}";
+                    return $this->procesarMensaje($mensajeConSucursal);
+                }
+            }
+        }
+
+        // ── Lógica según rol del usuario ─────────────────────────────────────
+        if (Auth::check()) {
+            $user = Auth::user();
+
+            if ($user->role === 'admin') {
+                // Admin sin sucursal especificada en una intención que la requiere
+                // → pedirle que elija sucursal antes de continuar
+                if (!$sucursal && in_array($intencion, $this->intencionesConSucursal)) {
+                    // Guardar el mensaje original en sesión para reusarlo tras elegir sucursal
+                    Session::put('admin_mensaje_pendiente', $mensaje);
+                    return $this->pedirSucursalAlAdmin($intencion);
+                }
+            } else {
+                // Usuario normal: asignar su sucursal automáticamente si no especificó
+                if (!$sucursal && isset($user->sucursal_id) && $user->sucursal_id) {
+                    $sucursal = $this->obtenerNombreSucursal($user->sucursal_id);
+                }
+            }
+        }
+
+        // ── Lógica de reglas (intacta) ────────────────────────────────────────
+        if ($intencion !== 'desconocida') {
+            return match ($intencion) {
+                'stock'         => $this->consultarStock($mensajeNorm, $sucursal),
+                'precio'        => $this->consultarPrecio($mensajeNorm, $sucursal),
+                'promocion'     => $this->consultarPromociones($sucursal),
+                'horario'       => $this->consultarHorario(),
+                'ubicacion'     => $this->consultarUbicacion($sucursal),
+                'contacto'      => $this->consultarContacto($sucursal),
+                'info_sucursal' => $this->consultarInfoSucursal($sucursal),
+                default         => $this->respuestaNoEntendida(),
+            };
+        }
+
+        // ── Fallback: delegar a Groq ──────────────────────────────────────────
+        return $this->responderConGroq($mensaje);
+    }
+
+    /**
+     * Genera el mensaje que le pide al admin elegir una sucursal.
+     * Incluye las sucursales reales de la BD como opciones con prefijo "sucursal_".
+     * El frontend detecta ese prefijo para renderizar botones en lugar de texto.
+     */
+    private function pedirSucursalAlAdmin(string $intencion): string
+    {
+        $sucursales = Branch::select('id', 'name')->orderBy('name')->get();
+
+        $accion = match ($intencion) {
+            'stock'         => 'consultar stock',
+            'precio'        => 'consultar precios',
+            'ubicacion'     => 'ver la ubicación',
+            'contacto'      => 'ver el contacto',
+            'info_sucursal' => 'ver información',
+            default         => 'consultar',
+        };
+
+        // Serializar opciones como JSON para que el frontend las convierta en botones
+        $opciones = $sucursales->map(fn($b) => [
+            'label'  => $b->name,
+            'value'  => 'sucursal_' . strtolower($b->name),
+        ])->values()->toArray();
+
+        // Formato especial que el frontend detecta: __OPCIONES__[{...}]
+        $opcionesJson = json_encode($opciones, JSON_UNESCAPED_UNICODE);
+
+        return "🏢 ¿De cuál sucursal deseas {$accion}?\n\n__OPCIONES__{$opcionesJson}";
+    }
+
+    // ─── Fallback IA ────────────────────────────────────────────────────────────
+
+    /**
+     * Llama a Groq cuando las reglas no reconocen la intención.
+     * Mantiene historial de conversación en sesión (máx. 10 turnos = 20 mensajes).
+     */
+    private function responderConGroq(string $mensajeOriginal): string
+    {
+        // Recuperar historial de la sesión
+        $historial = Session::get('groq_historial', []);
+
+        // Agregar mensaje actual del usuario al historial
+        $historial[] = ['role' => 'user', 'content' => $mensajeOriginal];
+
+        try {
+            $respuesta = $this->groq->chat($historial, $this->buildSystemPrompt());
+
+            // Guardar respuesta de la IA en el historial
+            $historial[] = ['role' => 'assistant', 'content' => $respuesta];
+
+            // Mantener solo los últimos 20 mensajes (10 turnos) para no exceder tokens
+            if (count($historial) > 20) {
+                $historial = array_slice($historial, -20);
+            }
+
+            Session::put('groq_historial', $historial);
+
+            return $respuesta;
+
+        } catch (\RuntimeException $e) {
+            // Si Groq falla, mostrar mensaje de fallback amigable
+            Log::warning('Groq fallback falló: ' . $e->getMessage());
+            return $this->respuestaNoEntendida();
+        }
+    }
+
+    // ─── Detección de intención (sin cambios) ──────────────────────────────────
+
     private function detectarIntencion(string $mensaje): string
     {
-        // Detectar promociones PRIMERO (antes de stock) porque "hay" también es palabra clave de stock
-        if ($this->coincideAlgunasPalabras($mensaje, $this->palabrasClavePromo)) {
-            return 'promocion';
-        }
-
-        if ($this->coincideAlgunasPalabras($mensaje, $this->palabrasClaveStock)) {
-            return 'stock';
-        }
-
-        if ($this->coincideAlgunasPalabras($mensaje, $this->palabrasClavePrice)) {
-            return 'precio';
-        }
-
-        if ($this->coincideAlgunasPalabras($mensaje, $this->palabrasClaveInfoSucursal)) {
-            return 'info_sucursal';
-        }
-
-        if ($this->coincideAlgunasPalabras($mensaje, $this->palabrasClaveHorario)) {
-            return 'horario';
-        }
-
-        if ($this->coincideAlgunasPalabras($mensaje, $this->palabrasClaveUbicacion)) {
-            return 'ubicacion';
-        }
-
-        if ($this->coincideAlgunasPalabras($mensaje, $this->palabrasClaveContacto)) {
-            return 'contacto';
-        }
-
+        if ($this->coincideAlgunasPalabras($mensaje, $this->palabrasClavePromo))        return 'promocion';
+        if ($this->coincideAlgunasPalabras($mensaje, $this->palabrasClaveStock))        return 'stock';
+        if ($this->coincideAlgunasPalabras($mensaje, $this->palabrasClavePrice))        return 'precio';
+        if ($this->coincideAlgunasPalabras($mensaje, $this->palabrasClaveInfoSucursal)) return 'info_sucursal';
+        if ($this->coincideAlgunasPalabras($mensaje, $this->palabrasClaveHorario))      return 'horario';
+        if ($this->coincideAlgunasPalabras($mensaje, $this->palabrasClaveUbicacion))    return 'ubicacion';
+        if ($this->coincideAlgunasPalabras($mensaje, $this->palabrasClaveContacto))     return 'contacto';
         return 'desconocida';
     }
 
-    /**
-     * Verifica si alguna palabra clave está en el mensaje
-     */
     private function coincideAlgunasPalabras(string $mensaje, array $palabras): bool
     {
         foreach ($palabras as $palabra) {
-            if (str_contains($mensaje, $palabra)) {
-                return true;
-            }
+            if (str_contains($mensaje, $palabra)) return true;
         }
         return false;
     }
 
-    /**
-     * Detecta sucursal mencionada en el mensaje
-     */
     private function detectarSucursal(string $mensaje): ?string
     {
         foreach ($this->sucursalesConocidas as $sucursal) {
-            if (str_contains($mensaje, $sucursal)) {
-                return $sucursal;
-            }
+            if (str_contains($mensaje, $sucursal)) return $sucursal;
         }
         return null;
     }
 
-    /**
-     * Obtiene el nombre de sucursal por ID
-     */
     private function obtenerNombreSucursal(?int $id): ?string
     {
-        if (!$id) {
-            return null;
-        }
-
+        if (!$id) return null;
         $branch = Branch::find($id);
         return $branch ? strtolower($branch->name) : null;
     }
 
-    /**
-     * Extrae el nombre del producto del mensaje
-     */
     private function extraerProducto(string $mensaje): ?string
     {
-        // Remover palabras clave y palabras comunes
         $palabrasARemover = array_merge(
             $this->palabrasClaveStock,
             $this->palabrasClavePrice,
@@ -176,33 +400,20 @@ class ChatService
         }
 
         $texto = trim(preg_replace('/\s+/', ' ', $texto));
-
         return !empty($texto) ? $texto : null;
     }
 
-    /**
-     * Normaliza el texto para procesamiento
-     */
+    // ─── Normalización ─────────────────────────────────────────────────────────
+
     private function normalizarTexto(string $texto): string
     {
-        // Convertir a minúsculas
         $texto = mb_strtolower($texto, 'UTF-8');
-
-        // Remover acentos
         $texto = $this->removerAcentos($texto);
-
-        // Remover puntuación (mantener espacios)
         $texto = preg_replace('/[^\w\s]/', ' ', $texto);
-
-        // Remover espacios múltiples
         $texto = preg_replace('/\s+/', ' ', $texto);
-
         return trim($texto);
     }
 
-    /**
-     * Remueve acentos de un texto
-     */
     private function removerAcentos(string $texto): string
     {
         $acentos = [
@@ -213,10 +424,8 @@ class ChatService
         return str_replace(array_keys($acentos), array_values($acentos), $texto);
     }
 
-    /**
-     * Consulta stock de un producto por sucursal
-     * MEJORADO: Autocorrección, sugerencias, memoria de conversación, alerta de stock bajo
-     */
+    // ─── Consultas a BD (sin cambios respecto al original) ─────────────────────
+
     private function consultarStock(string $mensaje, ?string $sucursal): string
     {
         $producto = $this->extraerProducto($mensaje);
@@ -225,32 +434,24 @@ class ChatService
             return "¿Cuál es el nombre del producto que buscas? Ejemplo: \"¿Hay cemento?\"";
         }
 
-        // Construir query base
-        $query = Producto::whereRaw('LOWER(nombre) LIKE ?', ["%{$producto}%"]);
-
-        // Filtrar por sucursal si se especificó
+        $query   = Producto::whereRaw('LOWER(nombre) LIKE ?', ["%{$producto}%"]);
         $branchId = null;
+
         if ($sucursal) {
             $branch = Branch::whereRaw('LOWER(name) LIKE ?', ["%{$sucursal}%"])->first();
-
-            if (!$branch) {
-                return "❌ No encontré la sucursal \"{$sucursal}\".";
-            }
-
+            if (!$branch) return "❌ No encontré la sucursal \"{$sucursal}\".";
             $query->where('sucursal_id', $branch->id);
             $branchId = $branch->id;
         }
 
         $productoModelo = $query->first();
 
-        // Si NO encontró el producto, intentar autocorrección y sugerencias
         if (!$productoModelo) {
             $similar = $this->sugerirProductoSimilar($producto);
             if ($similar) {
                 return "🤔 No encontré exactamente **{$producto}**.\n\n¿Quisiste decir **{$similar['nombre']}**?\n\n_(Escribe \"sí\" o intenta con otro nombre)_";
             }
 
-            // Si no hay similar, sugerir productos relacionados
             $relacionados = $this->obtenerProductosRelacionados($producto, $branchId);
             if (!$relacionados->isEmpty()) {
                 $respuesta = "❌ No tenemos **{$producto}**, pero puedes ver:\n\n";
@@ -263,7 +464,6 @@ class ChatService
             return "❌ No encontré el producto \"{$producto}\".";
         }
 
-        // Guardar en sesión para memoria de conversación
         Session::put('chat_producto', $productoModelo->nombre);
         Session::put('chat_sucursal', $productoModelo->sucursal_id);
 
@@ -271,29 +471,23 @@ class ChatService
         $stock = $productoModelo->stock;
 
         if ($stock > 0) {
-            // Agregar alerta de stock bajo si es necesario
             $alerta = $stock <= 20 ? " ⚠️ *Stock bajo, se recomienda comprar pronto*" : "";
-            return "✅ Tenemos **{$stock} unidades** de **{$productoModelo->nombre}** en la  **{$nombreSucursal}**{$alerta}.";
-        } else {
-            // Si está agotado, sugerir alternativas
-            $alternativas = $this->obtenerProductosRelacionados($productoModelo->nombre, $branchId, 3);
-            $respuesta = "❌ Lo sentimos, **{$productoModelo->nombre}** está agotado en la **{$nombreSucursal}**.";
-            
-            if (!$alternativas->isEmpty()) {
-                $respuesta .= "\n\n💡 Alternativas disponibles:\n";
-                foreach ($alternativas as $alt) {
-                    $respuesta .= "• **{$alt->nombre}** - {$alt->stock} unidades disponibles\n";
-                }
-            }
-            
-            return $respuesta;
+            return "✅ Tenemos **{$stock} unidades** de **{$productoModelo->nombre}** en la **{$nombreSucursal}**{$alerta}.";
         }
+
+        $alternativas = $this->obtenerProductosRelacionados($productoModelo->nombre, $branchId, 3);
+        $respuesta = "❌ Lo sentimos, **{$productoModelo->nombre}** está agotado en la **{$nombreSucursal}**.";
+
+        if (!$alternativas->isEmpty()) {
+            $respuesta .= "\n\n💡 Alternativas disponibles:\n";
+            foreach ($alternativas as $alt) {
+                $respuesta .= "• **{$alt->nombre}** - {$alt->stock} unidades disponibles\n";
+            }
+        }
+
+        return $respuesta;
     }
 
-    /**
-     * Consulta precio de un producto por sucursal
-     * MEJORADO: Autocorrección, sugerencias, memoria de conversación
-     */
     private function consultarPrecio(string $mensaje, ?string $sucursal): string
     {
         $producto = $this->extraerProducto($mensaje);
@@ -302,32 +496,24 @@ class ChatService
             return "¿Cuál es el nombre del producto? Ejemplo: \"¿Cuál es el precio del cemento?\"";
         }
 
-        // Construir query base
-        $query = Producto::whereRaw('LOWER(nombre) LIKE ?', ["%{$producto}%"]);
-
-        // Filtrar por sucursal si se especificó
+        $query    = Producto::whereRaw('LOWER(nombre) LIKE ?', ["%{$producto}%"]);
         $branchId = null;
+
         if ($sucursal) {
             $branch = Branch::whereRaw('LOWER(name) LIKE ?', ["%{$sucursal}%"])->first();
-
-            if (!$branch) {
-                return "❌ No encontré la sucursal \"{$sucursal}\".";
-            }
-
+            if (!$branch) return "❌ No encontré la sucursal \"{$sucursal}\".";
             $query->where('sucursal_id', $branch->id);
             $branchId = $branch->id;
         }
 
         $productoModelo = $query->first();
 
-        // Si NO encontró el producto, intentar autocorrección y sugerencias
         if (!$productoModelo) {
             $similar = $this->sugerirProductoSimilar($producto);
             if ($similar) {
                 return "🤔 No encontré exactamente **{$producto}**.\n\n¿Quisiste decir **{$similar['nombre']}**?\n\n_(Escribe \"sí\" o intenta con otro nombre)_";
             }
 
-            // Si no hay similar, sugerir productos relacionados
             $relacionados = $this->obtenerProductosRelacionados($producto, $branchId);
             if (!$relacionados->isEmpty()) {
                 $respuesta = "❌ No tenemos **{$producto}**, pero puedes ver:\n\n";
@@ -340,35 +526,21 @@ class ChatService
             return "❌ No encontré el producto \"{$producto}\".";
         }
 
-        // Guardar en sesión para memoria de conversación
         Session::put('chat_producto', $productoModelo->nombre);
         Session::put('chat_sucursal', $productoModelo->sucursal_id);
 
         $nombreSucursal = $productoModelo->sucursal ? $productoModelo->sucursal->name : 'desconocida';
-
         return "💰 El precio de **{$productoModelo->nombre}** es **\${$productoModelo->precio}** en la sucursal **{$nombreSucursal}**.";
     }
 
-    /**
-     * Consulta promociones activas por sucursal
-     */
     private function consultarPromociones(?string $sucursal): string
     {
-        // Usar el scope active() del modelo que ya filtra fechas
         $query = Discount::active();
 
-        // Filtrar por sucursal si se especificó
         if ($sucursal) {
             $branch = Branch::whereRaw('LOWER(name) LIKE ?', ["%{$sucursal}%"])->first();
-
-            if (!$branch) {
-                return "❌ No encontré la sucursal \"{$sucursal}\".";
-            }
-
-            // Filtrar por sucursal usando la relación
-            $query->whereHas('branches', function ($q) use ($branch) {
-                $q->where('sucursal_id', $branch->id);
-            });
+            if (!$branch) return "❌ No encontré la sucursal \"{$sucursal}\".";
+            $query->whereHas('branches', fn($q) => $q->where('sucursal_id', $branch->id));
         }
 
         $promociones = $query->get();
@@ -379,12 +551,8 @@ class ChatService
 
         $respuesta = "🎉 **Promociones Activas:**\n\n";
         foreach ($promociones as $promo) {
-            $valor = $promo->type === 'percentage'
-                ? "{$promo->value}%"
-                : "\${$promo->value}";
-
+            $valor = $promo->type === 'percentage' ? "{$promo->value}%" : "\${$promo->value}";
             $respuesta .= "• **{$promo->name}**: {$valor}\n";
-
             if ($promo->fecha_fin) {
                 $respuesta .= "  *Válido hasta: " . $promo->fecha_fin->format('d/m/Y') . "*\n";
             }
@@ -393,17 +561,11 @@ class ChatService
         return $respuesta;
     }
 
-    /**
-     * Consulta horario general (fijo para todas las sucursales)
-     */
     private function consultarHorario(): string
     {
         return "🕐 **Horario:**\n\nLunes a Viernes: **8:00 AM - 5:00 PM**\nSábado y Domingo: Cerrado";
     }
 
-    /**
-     * Consulta ubicación de una sucursal
-     */
     private function consultarUbicacion(?string $sucursal): string
     {
         if (!$sucursal) {
@@ -411,17 +573,11 @@ class ChatService
         }
 
         $branch = Branch::whereRaw('LOWER(name) LIKE ?', ["%{$sucursal}%"])->first();
-
-        if (!$branch) {
-            return "❌ No encontré la sucursal \"{$sucursal}\".";
-        }
+        if (!$branch) return "❌ No encontré la sucursal \"{$sucursal}\".";
 
         return "📍 **{$branch->name}**\n\nDirección: {$branch->address}";
     }
 
-    /**
-     * Consulta contacto de una sucursal
-     */
     private function consultarContacto(?string $sucursal): string
     {
         if (!$sucursal) {
@@ -429,21 +585,11 @@ class ChatService
         }
 
         $branch = Branch::whereRaw('LOWER(name) LIKE ?', ["%{$sucursal}%"])->first();
+        if (!$branch) return "❌ No encontré la sucursal \"{$sucursal}\".";
 
-        if (!$branch) {
-            return "❌ No encontré la sucursal \"{$sucursal}\".";
-        }
-
-        $respuesta = "📞 **Contacto - {$branch->name}**\n\n";
-        $respuesta .= "☎️ Teléfono: {$branch->phone}\n";
-        $respuesta .= "📍 Dirección: {$branch->address}";
-
-        return $respuesta;
+        return "📞 **Contacto - {$branch->name}**\n\n☎️ Teléfono: {$branch->phone}\n📍 Dirección: {$branch->address}";
     }
 
-    /**
-     * Consulta información completa de una sucursal
-     */
     private function consultarInfoSucursal(?string $sucursal): string
     {
         if (!$sucursal) {
@@ -451,23 +597,15 @@ class ChatService
         }
 
         $branch = Branch::whereRaw('LOWER(name) LIKE ?', ["%{$sucursal}%"])->first();
+        if (!$branch) return "❌ No encontré la sucursal \"{$sucursal}\".";
 
-        if (!$branch) {
-            return "❌ No encontré la sucursal \"{$sucursal}\".";
-        }
-
-        $respuesta = "🏢 **{$branch->name}**\n\n";
-        $respuesta .= "📍 **Dirección:** {$branch->address}\n";
-        $respuesta .= "📞 **Teléfono:** {$branch->phone}\n";
-        $respuesta .= "🕐 **Horario:** Lunes a Viernes 8:00 AM - 5:00 PM\n";
-        $respuesta .= "📅 **Atendemos:** Lunes a Sábado";
-
-        return $respuesta;
+        return "🏢 **{$branch->name}**\n\n"
+            . "📍 **Dirección:** {$branch->address}\n"
+            . "📞 **Teléfono:** {$branch->phone}\n"
+            . "🕐 **Horario:** Lunes a Viernes 8:00 AM - 5:00 PM\n"
+            . "📅 **Atendemos:** Lunes a Sábado";
     }
 
-    /**
-     * Respuesta cuando no entiende el mensaje
-     */
     private function respuestaNoEntendida(): string
     {
         return "❓ No entendí tu pregunta. Puedo ayudarte con:\n\n"
@@ -479,161 +617,69 @@ class ChatService
             . "📞 **Contacto:** \"Teléfono de sucursal norte\"";
     }
 
-    /**
-     * MEJORA 1: Busca producto similar usando similar_text() y levenshtein()
-     * 
-     * Usa dos algoritmos para encontrar el producto más similar:
-     * - similar_text(): Compara la similitud porcentual
-     * - levenshtein(): Cuenta la diferencia de caracteres
-     * 
-     * @param string $textoIngresado El texto del usuario
-     * @return array|null ['nombre' => 'Producto', 'similitud' => 85] o null
-     */
+    // ─── Helpers fuzzy search (sin cambios) ────────────────────────────────────
+
     private function sugerirProductoSimilar(string $textoIngresado): ?array
     {
-        // Obtener todos los productos únicos por nombre
-        $productosUnicos = Producto::select('nombre')
-            ->distinct()
-            ->get()
-            ->pluck('nombre')
-            ->toArray();
+        $productosUnicos = Producto::select('nombre')->distinct()->get()->pluck('nombre')->toArray();
 
-        if (empty($productosUnicos)) {
-            return null;
-        }
+        if (empty($productosUnicos)) return null;
 
         $mejorCoincidencia = null;
-        $mejorPuntaje = 0;
-        $umbralMinimo = 60; // Porcentaje mínimo de similitud
+        $mejorPuntaje      = 0;
+        $umbralMinimo      = 60;
 
         foreach ($productosUnicos as $nombreProducto) {
             $nombreNorm = $this->normalizarTexto($nombreProducto);
-            
-            // Usar similar_text para porcentaje de similitud
-            $similitud = 0;
+            $similitud  = 0;
             similar_text($textoIngresado, $nombreNorm, $similitud);
-            
-            // Si similar_text da bajo resultado, usar levenshtein como alternativa
+
             if ($similitud < $umbralMinimo) {
                 $distancia = levenshtein($textoIngresado, $nombreNorm);
-                // Convertir distancia a porcentaje (menos distancia = más similitud)
-                $maxLen = max(strlen($textoIngresado), strlen($nombreNorm));
+                $maxLen    = max(strlen($textoIngresado), strlen($nombreNorm));
                 if ($maxLen > 0) {
                     $similitud = (1 - ($distancia / $maxLen)) * 100;
                 }
             }
 
-            // Guardar el mejor resultado
             if ($similitud > $mejorPuntaje && $similitud >= $umbralMinimo) {
-                $mejorPuntaje = $similitud;
-                $mejorCoincidencia = [
-                    'nombre' => $nombreProducto,
-                    'similitud' => (int)$similitud
-                ];
+                $mejorPuntaje      = $similitud;
+                $mejorCoincidencia = ['nombre' => $nombreProducto, 'similitud' => (int)$similitud];
             }
         }
 
         return $mejorCoincidencia;
     }
 
-    /**
-     * MEJORA 2: Obtiene productos relacionados por categoría o nombre similar
-     * 
-     * Cuando un producto no existe o está agotado, sugiere alternativas:
-     * - Primero por categoría (si existe categoria_id)
-     * - Luego por nombre similar
-     * - Limitado a 3-5 productos
-     * 
-     * @param string $nombreProducto Nombre del producto buscado
-     * @param int|null $branchId ID de sucursal (opcional)
-     * @param int $limite Máximo de sugerencias (default 3)
-     * @return \Illuminate\Database\Eloquent\Collection
-     */
-    private function obtenerProductosRelacionados(
-        string $nombreProducto,
-        ?int $branchId = null,
-        int $limite = 3
-    ) {
-        // Normalizar el nombre para búsqueda
+    private function obtenerProductosRelacionados(string $nombreProducto, ?int $branchId = null, int $limite = 3)
+    {
         $nombreNorm = $this->normalizarTexto($nombreProducto);
 
         $query = Producto::query()
-            ->where('stock', '>', 0) // Solo productos con stock
+            ->where('stock', '>', 0)
             ->limit($limite);
 
-        // Si se especificó sucursal, filtrar por ella
-        if ($branchId) {
-            $query->where('sucursal_id', $branchId);
-        }
+        if ($branchId) $query->where('sucursal_id', $branchId);
 
-        // Intentar encontrar por similitud de nombre
         $query->whereRaw('LOWER(nombre) LIKE ?', ["%{$nombreNorm}%"]);
-
         $productos = $query->get();
 
-        // Si no hay coincidencias de nombre, buscar por similitud fuzzy
         if ($productos->isEmpty()) {
-            $todosLosProductos = Producto::where('stock', '>', 0)
+            $todos = Producto::where('stock', '>', 0)
                 ->when($branchId, fn($q) => $q->where('sucursal_id', $branchId))
                 ->get();
 
-            // Calcular similitud con cada producto
-            $conPuntaje = $todosLosProductos->map(function ($prod) use ($nombreNorm) {
+            return $todos->map(function ($prod) use ($nombreNorm) {
                 $similitud = 0;
                 similar_text($nombreNorm, $this->normalizarTexto($prod->nombre), $similitud);
-                return [
-                    'producto' => $prod,
-                    'similitud' => $similitud
-                ];
+                return ['producto' => $prod, 'similitud' => $similitud];
             })
-            ->filter(fn($item) => $item['similitud'] > 40) // Filtrar por mínimo
+            ->filter(fn($item) => $item['similitud'] > 40)
             ->sortByDesc('similitud')
             ->take($limite)
             ->pluck('producto');
-
-            return $conPuntaje;
         }
 
         return $productos;
     }
-
-    /**
-     * MEJORA 3: Maneja memoria de conversación usando sesión de Laravel
-     * 
-     * Guarda el contexto de la conversación para entender:
-     * - "¿Hay stock?" → Usa el último producto consultado
-     * - "¿Y el precio?" → Usa producto y sucursal guardadas
-     * - etc.
-     * 
-     * @param string $mensaje Mensaje del usuario
-     * @param string $intencion Intención detectada
-     * @return string Mensaje con contexto aplicado o original
-     */
-    private function manejarMemoriaConversacion(string $mensaje, string $intencion): string
-    {
-        // Palabras que indican "usar contexto"
-        $palabraContexto = ['y', 'el', 'la', 'ese', 'eso', 'ese mismo'];
-        $tieneContexto = false;
-
-        foreach ($palabraContexto as $palabra) {
-            if (str_contains($mensaje, $palabra)) {
-                $tieneContexto = true;
-                break;
-            }
-        }
-
-        if (!$tieneContexto) {
-            return $mensaje;
-        }
-
-        // Si hay producto guardado en sesión, incluirlo
-        $productoBuscado = Session::get('chat_producto');
-        if ($productoBuscado && !str_contains($mensaje, $productoBuscado)) {
-            $mensaje .= " {$productoBuscado}";
-        }
-
-        return $mensaje;
-    }
-
-
 }

@@ -1,15 +1,13 @@
 <div class="fixed inset-0 flex items-center justify-center z-40 pointer-events-none" 
      x-data="initSessionTimeout()"
-     @mounted="init()"
-     x-cloak>
+     @mounted="init()">
     
     <!-- Alerta de sesión por expirar - Centrada en la pantalla -->
     <div x-show="showWarning" 
-         x-cloak
-         x-transition:enter="transition ease-out duration-300"
+         x-transition:enter="transition ease-out duration-200"
          x-transition:enter-start="opacity-0 transform scale-95"
          x-transition:enter-end="opacity-100 transform scale-100"
-         x-transition:leave="transition ease-in duration-200"
+         x-transition:leave="transition ease-in duration-150"
          x-transition:leave-start="opacity-100 transform scale-100"
          x-transition:leave-end="opacity-0 transform scale-95"
          :class="showWarning ? 'z-[9999] pointer-events-auto' : 'z-40 pointer-events-none'"
@@ -69,29 +67,27 @@ function initSessionTimeout() {
             
             console.log('🟢 Session timeout monitoring initialized');
             
-            // Iniciar tracking con pequeño delay para evitar flashes
-            setTimeout(() => {
-                this.startInactivityTracking();
-                this.startPolling();
-                this.initPageVisibilityDetection();
-            }, 500);
+            // Iniciar tracking inmediatamente para evitar parpadeos
+            this.startInactivityTracking();
+            this.startPolling();
+            this.initPageVisibilityDetection();
             
             // Detectar actividad en el documento (solo si NO hay alerta)
             document.addEventListener('mousemove', () => {
                 if (!this.showWarning) {
                     this.resetInactivityTimer();
                 }
-            });
+            }, { passive: true });
             document.addEventListener('keydown', () => {
                 if (!this.showWarning) {
                     this.resetInactivityTimer();
                 }
-            });
+            }, { passive: true });
             document.addEventListener('click', () => {
                 if (!this.showWarning) {
                     this.resetInactivityTimer();
                 }
-            });
+            }, { passive: true });
         },
 
         /**
@@ -165,7 +161,11 @@ function initSessionTimeout() {
                 
                 if (self.inactivitySeconds >= (self.totalTimeout - self.warningThreshold)) {
                     if (!self.showWarning) {
-                        console.log('⚠️ Session warning - showing alert');
+                        console.log('⚠️ Session warning - showing alert', {
+                            inactivitySeconds: self.inactivitySeconds,
+                            totalTimeout: self.totalTimeout,
+                            warningThreshold: self.warningThreshold
+                        });
                         self.showWarning = true;
                     }
                     self.timeRemaining = Math.max(0, self.totalTimeout - self.inactivitySeconds);
@@ -244,47 +244,38 @@ function initSessionTimeout() {
         },
 
         autoLogout() {
-            console.log('🔴 Auto logout - redirecting to login');
+            console.log('🔴 Auto logout - redirecting to session expired page');
             if (this.inactivityTimer) clearInterval(this.inactivityTimer);
             if (this.pollingTimer) clearInterval(this.pollingTimer);
             
-            const form = document.createElement('form');
-            form.method = 'POST';
-            form.action = '/logout';
-            const token = document.createElement('input');
-            token.type = 'hidden';
-            token.name = '_token';
-            token.value = document.querySelector('meta[name="csrf-token"]')?.content || '';
-            form.appendChild(token);
-            document.body.appendChild(form);
-            form.submit();
+            // Ocultar la alerta con transición suave
+            this.showWarning = false;
+            
+            // Esperar 300ms para que la transición se complete, luego redirigir
+            setTimeout(() => {
+                window.location.href = '/session-expired';
+            }, 300);
         },
 
         logout() {
             console.log('👤 User clicked "Logout"');
-            const form = document.createElement('form');
-            form.method = 'POST';
-            form.action = '/logout';
-            const token = document.createElement('input');
-            token.type = 'hidden';
-            token.name = '_token';
-            token.value = document.querySelector('meta[name="csrf-token"]')?.content || '';
-            form.appendChild(token);
-            document.body.appendChild(form);
-            form.submit();
-        },
-
-        formatTime(seconds) {
-            const form = document.createElement('form');
-            form.method = 'POST';
-            form.action = '/logout';
-            const token = document.createElement('input');
-            token.type = 'hidden';
-            token.name = '_token';
-            token.value = document.querySelector('meta[name="csrf-token"]')?.content || '';
-            form.appendChild(token);
-            document.body.appendChild(form);
-            form.submit();
+            
+            // Ocultar la alerta con transición suave antes de logout
+            this.showWarning = false;
+            
+            // Esperar 300ms para que la transición se complete, luego logout
+            setTimeout(() => {
+                const form = document.createElement('form');
+                form.method = 'POST';
+                form.action = '/logout';
+                const token = document.createElement('input');
+                token.type = 'hidden';
+                token.name = '_token';
+                token.value = document.querySelector('meta[name="csrf-token"]')?.content || '';
+                form.appendChild(token);
+                document.body.appendChild(form);
+                form.submit();
+            }, 300);
         },
 
         formatTime(seconds) {

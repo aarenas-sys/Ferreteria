@@ -51,7 +51,7 @@
                         <h3 class="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide">Imagen</h3>
                         @if($producto->imagen)
                             <div class="mt-2">
-                                <img src="{{ asset('storage/' . $producto->imagen) }}" alt="Imagen del producto" class="max-w-xs h-auto rounded-lg shadow">
+                                <img src="{{ \App\Helpers\CloudinaryHelper::getImageUrl($producto->imagen, 600, 600) }}" alt="Imagen del producto" class="max-w-xs h-auto rounded-lg shadow">
                             </div>
                         @else
                             <p class="mt-2 text-gray-500 dark:text-gray-400">Sin imagen</p>

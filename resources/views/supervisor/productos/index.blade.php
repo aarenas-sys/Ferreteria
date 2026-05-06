@@ -138,7 +138,7 @@
                                                         </svg>
                                                     </button>
                                                     <div class="tooltip absolute z-10 invisible opacity-0 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg shadow-lg p-2 transition-opacity duration-200 max-w-xs">
-                                                        <img src="{{ asset('storage/' . $producto->imagen) }}" alt="Imagen del producto" class="max-w-full h-auto rounded">
+                                                        <img src="{{ \App\Helpers\CloudinaryHelper::getImageUrl($producto->imagen, 400, 400) }}" alt="Imagen del producto" class="max-w-full h-auto rounded">
                                                         <p class="text-xs text-gray-600 dark:text-gray-400 mt-1">{{ $producto->nombre }}</p>
                                                     </div>
                                                 </div>

@@ -55,7 +55,7 @@
         @if(isset($producto) && $producto->imagen)
             <div class="mt-2">
                 <p class="text-sm text-gray-600 dark:text-gray-400">Imagen actual:</p>
-                <img src="{{ asset('storage/' . $producto->imagen) }}" alt="Imagen del producto" class="mt-1 h-20 w-20 object-cover rounded">
+                <img src="{{ \App\Helpers\CloudinaryHelper::getImageUrl($producto->imagen, 80, 80) }}" alt="Imagen del producto" class="mt-1 h-20 w-20 object-cover rounded">
             </div>
         @endif
     </div>

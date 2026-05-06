@@ -1,3 +1,15 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* ─── Prevenir flickering de Alpine.js ─────────────────────────────────────── */
+[x-cloak] {
+    display: none !important;
+}
+
+/* Componentes que inician ocultos para evitar parpadeo */
+[data-component-hidden] {
+    display: none !important;
+    visibility: hidden !important;
+    opacity: 0 !important;
+}

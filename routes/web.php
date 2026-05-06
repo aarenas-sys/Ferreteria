@@ -139,6 +139,7 @@ Route::get('/chat', function () {
 })->name('chat');
 Route::post('/chat', [\App\Http\Controllers\ChatController::class, 'chat'])->name('chat.send');
 Route::post('/chat/imagen', [\App\Http\Controllers\ChatController::class, 'buscarPorImagen'])->name('chat.imagen');
+Route::post('/chat/clear', [\App\Http\Controllers\ChatController::class, 'clearHistory'])->name('chat.clear'); // ← agregar esta
 
 // Admin routes
 Route::middleware(['auth', 'session.timeout', 'role:admin'])->prefix('admin')->name('admin.')->group(function () {

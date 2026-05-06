@@ -6,18 +6,16 @@ use App\Services\ChatService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Session;
 
 class ChatController extends Controller
 {
-    protected ChatService $chatService;
-
-    public function __construct(ChatService $chatService)
-    {
-        $this->chatService = $chatService;
-    }
+    public function __construct(protected ChatService $chatService) {}
 
     /**
-     * Procesa un mensaje del usuario y devuelve una respuesta
+     * Procesa un mensaje del usuario y devuelve una respuesta.
+     * Si las reglas no reconocen la intención, ChatService delega a Groq automáticamente.
      */
     public function chat(Request $request): JsonResponse
     {
@@ -26,86 +24,108 @@ class ChatController extends Controller
         ]);
 
         $mensaje = $request->input('mensaje');
-        
+
         try {
             $respuesta = $this->chatService->procesarMensaje($mensaje);
-            
+
             return response()->json([
                 'respuesta' => $respuesta,
-                'estado' => 'exito'
+                'estado'    => 'exito',
             ]);
+
         } catch (\Exception $e) {
             return response()->json([
                 'respuesta' => 'Hubo un error procesando tu mensaje. Intenta de nuevo.',
-                'estado' => 'error',
-                'detalles' => $e->getMessage() // Solo en desarrollo
+                'estado'    => 'error',
+                'detalles'  => $e->getMessage(),
             ], 500);
         }
     }
 
     /**
-     * Valida y procesa la imagen junto con el mensaje
-     * 
+     * Recibe imagen + mensaje, usa Groq Vision para identificar el producto
+     * y luego aplica la lógica normal de consulta (admin/sucursal).
+     *
      * Validaciones:
-     * - Una sola imagen
-     * - Solo JPG, PNG
+     * - Solo JPG / PNG
      * - Máximo 10MB
-     * 
-     * Flujo:
-     * 1. Usuario sube imagen
-     * 2. Usuario escribe mensaje
-     * 3. Envía ambos
-     * 4. Backend responde basado SOLO en el mensaje (sin procesar imagen)
+     * - Archivo real (getimagesize)
      */
     public function buscarPorImagen(Request $request): JsonResponse
     {
         $request->validate([
-            'imagen' => 'required|image|mimes:jpeg,jpg,png|max:10240',
+            'imagen'  => 'required|image|mimes:jpeg,jpg,png|max:10240',
             'mensaje' => 'nullable|string|max:1000',
         ]);
 
         try {
             $archivo = $request->file('imagen');
-            $mensaje = $request->input('mensaje', '');
+            $mensaje = trim($request->input('mensaje', ''));
 
-            // Validar que es un archivo válido
             if (!$archivo || !$archivo->isValid()) {
                 return response()->json([
                     'respuesta' => '❌ Archivo inválido. Intenta con otra imagen.',
-                    'estado' => 'error'
+                    'estado'    => 'error',
                 ], 400);
             }
 
-            // Validar que es una imagen de verdad (no solo extensión falsa)
-            $rutaTmp = $archivo->getRealPath();
-            if (!getimagesize($rutaTmp)) {
+            if (!getimagesize($archivo->getRealPath())) {
                 return response()->json([
-                    'respuesta' => '❌ El archivo no es una imagen válida. Verifica que no esté corrupto.',
-                    'estado' => 'error'
+                    'respuesta' => '❌ El archivo no es una imagen válida.',
+                    'estado'    => 'error',
                 ], 400);
             }
 
-            // Si hay mensaje, procesarlo normalmente
-            if ($mensaje) {
-                $respuesta = $this->chatService->procesarMensaje($mensaje);
-                return response()->json([
-                    'respuesta' => $respuesta,
-                    'estado' => 'exito'
-                ]);
-            }
+            // Convertir imagen a base64 para enviar a Groq Vision
+            $imagenBase64 = base64_encode(file_get_contents($archivo->getRealPath()));
+            $mimeType     = $archivo->getMimeType(); // 'image/jpeg' o 'image/png'
 
-            // Si NO hay mensaje, solo confirmar que se cargó la imagen
+            // Delegar a ChatService que orquesta Vision + BD + lógica admin/sucursal
+            $respuesta = $this->chatService->procesarMensajeConImagen(
+                $imagenBase64,
+                $mimeType,
+                $mensaje
+            );
+
             return response()->json([
-                'respuesta' => '✔ Imagen cargada - escribe el nombre del producto',
-                'estado' => 'exito'
+                'respuesta' => $respuesta,
+                'estado'    => 'exito',
             ]);
 
         } catch (\Exception $e) {
-            \Illuminate\Support\Facades\Log::error('Error procesando imagen: ' . $e->getMessage());
+            Log::error('Error procesando imagen: ' . $e->getMessage());
             return response()->json([
-                'respuesta' => '❌ Error procesando imagen. Intenta con otra o reinicia el chat.',
-                'estado' => 'error'
+                'respuesta' => '❌ Error procesando imagen. Intenta de nuevo.',
+                'estado'    => 'error',
             ], 500);
         }
+    }
+
+    /**
+     * Limpia el historial de conversación de Groq (sesión).
+     * Útil para que el usuario "reinicie" el contexto de la IA.
+     * 
+     * También limpia:
+     * - Historial de Groq
+     * - Producto seleccionado en chat
+     * - Sucursal seleccionada
+     * - Descripciones de imágenes anteriores
+     * - Productos confirmados por imagen
+     */
+    public function clearHistory(): JsonResponse
+    {
+        Session::forget('groq_historial');
+        Session::forget('chat_producto');
+        Session::forget('chat_sucursal');
+        Session::forget('imagen_descripcion');
+        Session::forget('imagen_producto_confirmado');
+        Session::forget('admin_mensaje_pendiente');
+
+        Log::info('Chat history cleared for user: ' . (Auth::id() ?? 'guest'));
+
+        return response()->json([
+            'estado' => 'ok',
+            'mensaje' => 'Historial limpiado correctamente'
+        ]);
     }
 }
